@@ -101,7 +101,7 @@ data/*
 
 # Ignore development notebooks and code
 dev/
-
+.devcontainer
 # CPU/GPU profiling script
 gpu_profiling.py
 
