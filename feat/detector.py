@@ -639,6 +639,22 @@ class Detector(nn.Module, PyTorchModelHubMixin):
                     pred_boxes_xyxy[:, 2] += pred_boxes_xyxy[:, 0]
                     pred_boxes_xyxy[:, 3] += pred_boxes_xyxy[:, 1]
 
+                    # --- SPRINT 5: ADAPTIVE PADDING ---
+                    # Expand the box by 20% to prevent "Drifting Crop" errors
+                    pad_factor = 0.2
+                    w = pred_boxes[:, 2]
+                    h = pred_boxes[:, 3]
+
+                    # Apply padding
+                    pred_boxes_xyxy[:, 0] -= w * pad_factor # x1
+                    pred_boxes_xyxy[:, 1] -= h * pad_factor # y1
+                    pred_boxes_xyxy[:, 2] += w * pad_factor # x2
+                    pred_boxes_xyxy[:, 3] += h * pad_factor # y2
+
+                    # Clamp to 0 to avoid negative indices
+                    pred_boxes_xyxy[pred_boxes_xyxy < 0] = 0
+                    # ----------------------------------
+
                     # Extract faces from the image
                     img_tensor = batch_data["Image"]
                     extracted_faces, new_bboxes = extract_face_from_bbox_torch(
