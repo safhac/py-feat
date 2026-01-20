@@ -525,6 +525,7 @@ class Detector(nn.Module, PyTorchModelHubMixin):
         face_detection_threshold=0.5,
         skip_frames=None,
         progress_bar=True,
+        detection_interval=1,
         save=None,
         **kwargs,
     ):
@@ -599,83 +600,155 @@ class Detector(nn.Module, PyTorchModelHubMixin):
             )
 
         for batch_id, batch_data in enumerate(data_iterator):
-            faces_data = self.detect_faces(
-                batch_data["Image"],
-                face_size=self.face_size if hasattr(self, "face_size") else 112,
-                face_detection_threshold=face_detection_threshold,
+            # --- HYBRID SWITCH LOGIC (SPRINT 3.2) ---
+            # We skip detection IF:
+            # 1. We have active trackers
+            # 2. We are in video mode
+            # 3. We are NOT on a "correction frame"
+            # 4. Batch size is 1 (Tracking requires sequential processing)
+
+            is_correction_frame = batch_id % detection_interval == 0
+            is_video = data_type.lower() == "video"
+            should_track = (
+                (len(self.trackers) > 0)
+                and is_video
+                and (not is_correction_frame)
+                and (batch_size == 1)
             )
 
-            # --- START TRACKING INTEGRATION (SPRINT 3.3 FINAL) ---
+            faces_data = []
             batch_track_ids = []
-            if data_type.lower() == "video":
-                for frame_data in faces_data:
-                    # 0. Init IDs for this frame (Default -1)
-                    num_faces = len(frame_data["scores"])
-                    frame_ids = np.full(num_faces, -1, dtype=int)
 
-                    # 1. Prepare detections
-                    dets_xyxy = []
-                    if num_faces > 0 and not torch.isnan(frame_data["boxes"][0, 0]):
-                        dets_xyxy = frame_data["boxes"].cpu().numpy()
-                    else:
-                        dets_xyxy = np.empty((0, 4))
+            if should_track:
+                # === PATH A: TRACKING (FAST CPU) ===
+                # 1. Predict next state for all trackers
+                preds = []
+                valid_trackers = []
+                for trk in self.trackers:
+                    pos = trk.predict()[0]  # [x, y, w, h]
+                    if not np.any(np.isnan(pos)):
+                        preds.append(pos)
+                        valid_trackers.append(trk)
+                self.trackers = valid_trackers
 
-                    # 2. Predict & Filter dead trackers
-                    active_trackers = []
-                    active_trks_xyxy = []
-                    for trk in self.trackers:
-                        pos = trk.predict()[0]
-                        if not np.any(np.isnan(pos)):
-                            active_trackers.append(trk)
-                            active_trks_xyxy.append(
-                                [pos[0], pos[1], pos[0] + pos[2], pos[1] + pos[3], 0]
-                            )
+                # 2. Crop faces using predicted boxes
+                if len(preds) > 0:
+                    pred_boxes = torch.tensor(np.array(preds)).float()
+                    # Convert [x,y,w,h] -> [x1,y1,x2,y2] for extraction
+                    pred_boxes_xyxy = pred_boxes.clone()
+                    pred_boxes_xyxy[:, 2] += pred_boxes_xyxy[:, 0]
+                    pred_boxes_xyxy[:, 3] += pred_boxes_xyxy[:, 1]
 
-                    self.trackers = active_trackers
-                    trks_xyxy = np.array(active_trks_xyxy)
-
-                    # 3. Associate
-                    matched, unmatched_dets, _ = associate_detections_to_trackers(
-                        dets_xyxy, trks_xyxy
+                    # Extract faces from the image
+                    img_tensor = batch_data["Image"]
+                    extracted_faces, new_bboxes = extract_face_from_bbox_torch(
+                        img_tensor,
+                        pred_boxes_xyxy,
+                        face_size=self.face_size if hasattr(self, "face_size") else 112,
                     )
 
-                    # 4. Update Matched & Store IDs
-                    for m in matched:
-                        idx_face = m[0]
-                        idx_trk = m[1]
-                        d = dets_xyxy[idx_face]
-                        self.trackers[idx_trk].update(
-                            [d[0], d[1], d[2] - d[0], d[3] - d[1]]
+                    # 3. Construct faces_data (Fake the detection scores/poses)
+                    frame_results = {
+                        "face_id": 0,
+                        "faces": extracted_faces,
+                        "boxes": pred_boxes_xyxy,
+                        "new_boxes": new_bboxes,
+                        "poses": torch.zeros((len(preds), 6)),
+                        "scores": torch.ones((len(preds))),
+                    }
+
+                    if self.info["emotion_model"] == "resmasknet":
+                        res_faces, _ = extract_face_from_bbox_torch(
+                            img_tensor, pred_boxes_xyxy, expand_bbox=1.1, face_size=224
                         )
-                        frame_ids[idx_face] = self.trackers[idx_trk].id
+                        frame_results["resmasknet_faces"] = res_faces
 
-                    # 5. Create New & Store IDs
-                    for i in unmatched_dets:
-                        d = dets_xyxy[i]
-                        new_trk = KalmanBoxTracker([d[0], d[1], d[2] - d[0], d[3] - d[1]])
-                        self.trackers.append(new_trk)
-                        frame_ids[i] = new_trk.id
+                    faces_data = [frame_results]
 
-                    batch_track_ids.append(frame_ids)
-            # --- END TRACKING INTEGRATION ---
+                    # 4. Store IDs (No association needed, order is preserved)
+                    ids = [t.id for t in self.trackers]
+                    batch_track_ids.append(np.array(ids))
+                else:
+                    # Fallback: Trackers died, force detection
+                    should_track = False
 
+            if not should_track:
+                # === PATH B: DETECTION (SLOW GPU) ===
+                faces_data = self.detect_faces(
+                    batch_data["Image"],
+                    face_size=self.face_size if hasattr(self, "face_size") else 112,
+                    face_detection_threshold=face_detection_threshold,
+                )
+
+                # Associate and Update Trackers
+                if is_video:
+                    for frame_data in faces_data:
+                        # Init IDs (-1 default)
+                        num_faces = len(frame_data["scores"])
+                        frame_ids = np.full(num_faces, -1, dtype=int)
+
+                        # Prepare detections
+                        dets_xyxy = []
+                        if num_faces > 0 and not torch.isnan(frame_data["boxes"][0, 0]):
+                            dets_xyxy = frame_data["boxes"].cpu().numpy()
+                        else:
+                            dets_xyxy = np.empty((0, 4))
+
+                        # Predict existing trackers (to get current state for comparison)
+                        active_trackers = []
+                        active_trks_xyxy = []
+                        for trk in self.trackers:
+                            pos = trk.predict()[0]
+                            if not np.any(np.isnan(pos)):
+                                active_trackers.append(trk)
+                                # Convert [x,y,w,h] -> [x1,y1,x2,y2]
+                                active_trks_xyxy.append(
+                                    [pos[0], pos[1], pos[0] + pos[2], pos[1] + pos[3], 0]
+                                )
+
+                        self.trackers = active_trackers
+                        trks_xyxy = np.array(active_trks_xyxy)
+
+                        # Associate
+                        matched, unmatched_dets, _ = associate_detections_to_trackers(
+                            dets_xyxy, trks_xyxy
+                        )
+
+                        # Update Matched
+                        for m in matched:
+                            idx_face = m[0]
+                            idx_trk = m[1]
+                            d = dets_xyxy[idx_face]
+                            self.trackers[idx_trk].update(
+                                [d[0], d[1], d[2] - d[0], d[3] - d[1]]
+                            )
+                            frame_ids[idx_face] = self.trackers[idx_trk].id
+
+                        # Create New
+                        for i in unmatched_dets:
+                            d = dets_xyxy[i]
+                            new_trk = KalmanBoxTracker(
+                                [d[0], d[1], d[2] - d[0], d[3] - d[1]]
+                            )
+                            self.trackers.append(new_trk)
+                            frame_ids[i] = new_trk.id
+
+                        batch_track_ids.append(frame_ids)
+
+            # --- FORWARD PASS (Extract Features) ---
             batch_results = self.forward(faces_data)
 
             # --- ASSIGN TRACK IDS TO OUTPUT ---
-            if data_type.lower() == "video" and batch_track_ids:
+            if is_video and batch_track_ids:
                 all_ids = np.concatenate(batch_track_ids)
-                # Ensure length matches (just in case of nan handling differences)
                 if len(all_ids) == len(batch_results):
                     batch_results["TrackID"] = all_ids
                 else:
-                    # Fallback if sizes mismatch (should not happen if logic is correct)
                     batch_results["TrackID"] = np.nan
             else:
                 batch_results["TrackID"] = np.nan
 
-            # ----------------------------------
-
-            # Create metadata for each frame
+            # --- METADATA & POST-PROCESSING (Unchanged) ---
             file_names = []
             frame_ids = []
             for i, face in enumerate(faces_data):
