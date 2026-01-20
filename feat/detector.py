@@ -36,6 +36,7 @@ from feat.utils.image_operations import (
     convert_bbox_output,
     compute_original_image_size,
 )
+from feat.utils.tracker import KalmanBoxTracker, associate_detections_to_trackers
 from feat.data import Fex, ImageDataset, TensorDataset, VideoDataset
 from skops.io import load, get_untrusted_types
 from safetensors.torch import load_file
@@ -168,6 +169,8 @@ class Detector(nn.Module, PyTorchModelHubMixin):
             # self.landmark_detector = torch.compile(self.landmark_detector)
         else:
             self.landmark_detector = None
+
+        self.trackers = []  # initialize the tracker
 
         # Initialize AU Detector
         self.info["au_model"] = au_model
@@ -601,7 +604,76 @@ class Detector(nn.Module, PyTorchModelHubMixin):
                 face_size=self.face_size if hasattr(self, "face_size") else 112,
                 face_detection_threshold=face_detection_threshold,
             )
+
+            # --- START TRACKING INTEGRATION (SPRINT 3.3 FINAL) ---
+            batch_track_ids = []
+            if data_type.lower() == "video":
+                for frame_data in faces_data:
+                    # 0. Init IDs for this frame (Default -1)
+                    num_faces = len(frame_data["scores"])
+                    frame_ids = np.full(num_faces, -1, dtype=int)
+
+                    # 1. Prepare detections
+                    dets_xyxy = []
+                    if num_faces > 0 and not torch.isnan(frame_data["boxes"][0, 0]):
+                        dets_xyxy = frame_data["boxes"].cpu().numpy()
+                    else:
+                        dets_xyxy = np.empty((0, 4))
+
+                    # 2. Predict & Filter dead trackers
+                    active_trackers = []
+                    active_trks_xyxy = []
+                    for trk in self.trackers:
+                        pos = trk.predict()[0]
+                        if not np.any(np.isnan(pos)):
+                            active_trackers.append(trk)
+                            active_trks_xyxy.append(
+                                [pos[0], pos[1], pos[0] + pos[2], pos[1] + pos[3], 0]
+                            )
+
+                    self.trackers = active_trackers
+                    trks_xyxy = np.array(active_trks_xyxy)
+
+                    # 3. Associate
+                    matched, unmatched_dets, _ = associate_detections_to_trackers(
+                        dets_xyxy, trks_xyxy
+                    )
+
+                    # 4. Update Matched & Store IDs
+                    for m in matched:
+                        idx_face = m[0]
+                        idx_trk = m[1]
+                        d = dets_xyxy[idx_face]
+                        self.trackers[idx_trk].update(
+                            [d[0], d[1], d[2] - d[0], d[3] - d[1]]
+                        )
+                        frame_ids[idx_face] = self.trackers[idx_trk].id
+
+                    # 5. Create New & Store IDs
+                    for i in unmatched_dets:
+                        d = dets_xyxy[i]
+                        new_trk = KalmanBoxTracker([d[0], d[1], d[2] - d[0], d[3] - d[1]])
+                        self.trackers.append(new_trk)
+                        frame_ids[i] = new_trk.id
+
+                    batch_track_ids.append(frame_ids)
+            # --- END TRACKING INTEGRATION ---
+
             batch_results = self.forward(faces_data)
+
+            # --- ASSIGN TRACK IDS TO OUTPUT ---
+            if data_type.lower() == "video" and batch_track_ids:
+                all_ids = np.concatenate(batch_track_ids)
+                # Ensure length matches (just in case of nan handling differences)
+                if len(all_ids) == len(batch_results):
+                    batch_results["TrackID"] = all_ids
+                else:
+                    # Fallback if sizes mismatch (should not happen if logic is correct)
+                    batch_results["TrackID"] = np.nan
+            else:
+                batch_results["TrackID"] = np.nan
+
+            # ----------------------------------
 
             # Create metadata for each frame
             file_names = []
